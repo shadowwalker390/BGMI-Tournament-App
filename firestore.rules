@@ -1,0 +1,93 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------
+
+    function signedIn() {
+      return request.auth != null && request.auth.token.email != null;
+    }
+
+    // The Player ID is the part of the synthetic sign-in email before the @
+    // (e.g. "shadow_walker@players.bgmi-arena.app" -> "shadow_walker").
+    function myKey() {
+      return request.auth.token.email.split('@')[0];
+    }
+
+    // The app stores all players in one document: config/users { value: { <playerId>: {...} } }
+    function usersMap() {
+      return get(/databases/$(database)/documents/config/users).data.value;
+    }
+
+    // Admin status comes from the isAdmin flag on the signed-in player's own
+    // profile. Players cannot set it (see selfEdit below), so only an existing
+    // admin or you, directly in the Firebase console, can create an admin.
+    function isAdmin() {
+      return signedIn()
+        && myKey() in usersMap()
+        && usersMap()[myKey()].isAdmin == true;
+    }
+
+    // A non-admin player may change ONLY their own entry in the users map:
+    //  - registering: add their own profile, as a non-admin with zeroed stats
+    //  - later: change only wallet and ign (never isAdmin, points, kills,
+    //    wins, matches, playerId or bgmiUid)
+    function selfEdit() {
+      let before = resource.data.value;
+      let after = request.resource.data.value;
+      return after.diff(before).affectedKeys().hasOnly([myKey()])
+        && (
+          (
+            !(myKey() in before)
+            && after[myKey()].isAdmin == false
+            && after[myKey()].playerId.lower() == myKey()
+            && after[myKey()].points == 0
+            && after[myKey()].kills == 0
+            && after[myKey()].wins == 0
+            && after[myKey()].matches == 0
+            && after[myKey()].wallet <= 500   // keep in sync with START_WALLET in App.jsx
+          )
+          ||
+          (
+            myKey() in before
+            && after[myKey()].diff(before[myKey()]).affectedKeys().hasOnly(['wallet', 'ign'])
+          )
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Players
+    // -------------------------------------------------------------------
+
+    match /config/users {
+      allow read: if signedIn();
+
+      // Only used if the document doesn't exist yet (the very first signup).
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['value'])
+        && request.resource.data.value.keys().hasOnly([myKey()])
+        && request.resource.data.value[myKey()].isAdmin == false;
+
+      // Admins can update anyone (results, refunds); players only themselves.
+      allow update: if signedIn() && (isAdmin() || selfEdit());
+    }
+
+    // -------------------------------------------------------------------
+    // Match slots, one document per date: slots/2026-07-04
+    // -------------------------------------------------------------------
+    // NOTE: players must be able to write here to register for matches, and
+    // a whole day's slots live in one document, so these rules cannot stop a
+    // signed-in player from editing slot data. Fixing that needs a server-side
+    // function or one document per booking.
+    match /slots/{date} {
+      allow read, write: if signedIn();
+    }
+
+    // Everything else is closed.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
